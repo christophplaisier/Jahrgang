@@ -144,6 +144,9 @@ select{font:inherit;font-size:16px;padding:10px 12px;border-radius:12px;backgrou
 #ov.on{display:grid}
 .spin{width:46px;height:46px;border-radius:50%;border:4px solid #ffffff30;border-top-color:var(--acc);animation:sp 1s linear infinite;margin:0 auto 14px}
 @keyframes sp{to{transform:rotate(360deg)}}
+.devline{text-align:center;font-size:15px;max-width:360px}
+.devline .devs{justify-content:center;margin-top:10px}
+.perr{color:#ffb3c3;background:#ef476f1f;border:1px solid #ef476f55;border-radius:12px;padding:10px 12px;line-height:1.4;text-align:left}
 .vinyl{width:120px;height:120px;animation:sp 6s linear infinite}
 </style>
 </head>
@@ -171,7 +174,7 @@ let view='home';
 const ng={players:LS.get('jg_lastPlayers',['Spieler 1','Spieler 2']),selected:new Set(LS.get('jg_lastPl',[])),playlists:null,devices:null};
 
 const saveSettings=()=>LS.set('jg_settings',settings);
-const saveGame=()=>{if(game){const g=Object.assign({},game,{playing:false});LS.set('jg_game',g)}};
+const saveGame=()=>{if(game){const g=Object.assign({},game,{playing:false,playBusy:false,devPick:false,playErr:null});LS.set('jg_game',g)}};
 const h=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 /* ---------- UI helpers ---------- */
@@ -263,6 +266,26 @@ async function spPlay(uri){
     if(err.status===403)throw new Error('Spotify verweigert die Wiedergabe. Premium ist nötig, und das Gerät muss Fernsteuerung erlauben.');
     throw err;
   }
+  return await verifyPlay(uri);
+}
+const wait=ms=>new Promise(r=>setTimeout(r,ms));
+async function playerState(){try{return await api('/me/player')}catch(e){return null}}
+const isOn=(st,uri)=>st&&st.item&&st.item.uri===uri&&st.is_playing;
+async function verifyPlay(uri){
+  await wait(1300);
+  let st=await playerState();
+  if(isOn(st,uri))return st;
+  // Gerät aufwecken: Wiedergabe gezielt aufs gewählte Gerät übertragen, dann erneut starten
+  if(settings.deviceId){
+    try{await api('/me/player',{method:'PUT',body:JSON.stringify({device_ids:[settings.deviceId],play:false})})}catch(e){}
+    await wait(900);
+    try{await api('/me/player/play'+devQ(),{method:'PUT',body:JSON.stringify({uris:[uri],position_ms:startPos()})})}catch(e){}
+    await wait(1300);
+    st=await playerState();
+    if(isOn(st,uri))return st;
+  }
+  if(st&&st.device)throw new Error(`Spotify ist mit „${st.device.name}“ verbunden, aber der Song läuft nicht. Öffne Spotify auf diesem Gerät, spiele kurz etwas an, komm zurück und tippe auf Play – oder wähle unten ein anderes Gerät.`);
+  throw new Error('Spotify hat den Befehl angenommen, aber nichts spielt. Öffne die Spotify-App, spiele kurz irgendeinen Song an, komm zurück und tippe auf Play.');
 }
 
 /* ---------- Demo deck (ohne Spotify) ---------- */
@@ -285,8 +308,10 @@ function computeResult(){
 }
 async function playCurrent(){
   if(!game||game.demo)return;
-  try{await spPlay(game.current.uri);game.playing=true}catch(e){game.playing=false;toast(e.message,6500)}
-  render();
+  game.playErr=null;game.playBusy=true;render();
+  try{const st=await spPlay(game.current.uri);game.playing=true;game.devName=st&&st.device?st.device.name:null}
+  catch(e){game.playing=false;game.playErr=e.message}
+  game.playBusy=false;render();
 }
 async function togglePlay(){
   if(game.demo)return;
@@ -421,7 +446,10 @@ function controls(){
   const p=game.players[game.turn];
   const skip=game.phase==='listen'?`<button class="btn small" data-a="skip" ${p.tokens<1?'disabled':''}>Song tauschen · 1 Chip</button>`:'';
   if(game.demo)return `<div class="ctrls">${skip}</div>`;
-  return `<div class="ctrls"><button class="round" data-a="restart" aria-label="Von vorn">${ICON.restart}</button><button class="round main" data-a="toggle" aria-label="Play/Pause">${game.playing?ICON.pause:ICON.play}</button>${skip}</div>`;
+  const devs=game.devPick?(ng.devices&&ng.devices.length?`<div class="devs">${ng.devices.map(d=>`<button class="chip ${settings.deviceId===d.id?'on':''}" data-a="pickDev" data-id="${h(d.id)}">${h(d.name)} <small>${h(d.type)}</small></button>`).join('')}</div>`:'<p class="warn">Kein Gerät gefunden. Öffne Spotify und spiele kurz etwas an.</p>'):'';
+  const status=game.playBusy?'<span class="muted">Starte Wiedergabe …</span>':game.playErr?`<div class="perr">${h(game.playErr)}</div>`:game.devName?`<span class="muted">Spielt auf: <b>${h(game.devName)}</b></span>`:'';
+  return `<div class="ctrls"><button class="round" data-a="restart" aria-label="Von vorn">${ICON.restart}</button><button class="round main" data-a="toggle" aria-label="Play/Pause">${game.playing?ICON.pause:ICON.play}</button>${skip}</div>
+   <div class="devline">${status}<div class="row2" style="justify-content:center;margin-top:8px"><a class="btn small" href="spotify:">Spotify öffnen</a><button class="btn small" data-a="devPick">${game.devPick?'Geräte aktualisieren':'Gerät wechseln'}</button></div>${devs}</div>`;
 }
 
 function vGame(){
@@ -521,7 +549,15 @@ const A={
     }catch(e){if(silent!==true)toast(e.message)}
     if(view==='new')render();
   },
-  pickDev(b){settings.deviceId=b.dataset.id;saveSettings();render()},
+  pickDev(b){
+    settings.deviceId=b.dataset.id;saveSettings();
+    if(view==='game'&&game){game.devPick=false;playCurrent();return}
+    render();
+  },
+  async devPick(){
+    try{ng.devices=await getDevices()}catch(e){game.playErr=e.message}
+    game.devPick=true;render();
+  },
   async startSp(){
     const names=ng.players.map(s=>s.trim()).filter(Boolean);
     if(!names.length)return toast('Mindestens eine Person eintragen.');
